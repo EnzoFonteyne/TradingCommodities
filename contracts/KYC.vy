@@ -37,6 +37,11 @@ event CompanyUpdated:
 event OwnerUpdated:
     timestamp: uint256
 
+event UpdateApproved:
+    user: address
+    timestamp: uint256
+
+
 @external
 @view
 def get_passport_hash(user: address) -> bytes32:
@@ -161,6 +166,51 @@ def update_owner_info(
     log OwnerUpdated(block.timestamp)
 
 @external
+def register_company(
+    _name: String[100],
+    _hq_address: String[200],
+    _city: String[50],
+    _country: String[50],
+    _company_id: String[50],
+    _registration_institution: String[100],
+    _phone: String[20],
+    _mobile: String[20],
+    _legal_representative: String[100],
+    _position: String[50],
+    _passport_number: String[20],
+    _passport_country: String[50],
+    _email: String[100],
+    _passport_hash: bytes32
+):
+    assert _name != "", "Name required"
+    assert _country != "", "Country required"
+    assert _company_id != "", "Company ID required"
+    assert _registration_institution != "", "Registration institution required"
+    assert _legal_representative != "", "Legal representative required"
+    assert _passport_number != "", "Passport number required"
+    assert _passport_hash != empty(bytes32), "Passport hash required"
+    assert not self.companies[msg.sender].name, "Company already registered"
+    assert msg.sender != self.owner, "Owner cannot register as a company"
+
+    self.companies[msg.sender] = CompanyInfo({
+        name: _name,
+        headquarters_address: _hq_address,
+        city: _city,
+        country: _country,
+        company_id: _company_id,
+        registration_institution: _registration_institution,
+        phone: _phone,
+        mobile: _mobile,
+        legal_representative: _legal_representative,
+        position: _position,
+        passport_number: _passport_number,
+        passport_country: _passport_country,
+        email: _email,
+        passport_hash: _passport_hash
+    })
+    log CompanyRegistered(msg.sender, _company_id)
+
+@external
 def update_company_info(
     _name: String[100],
     _hq_address: String[200],
@@ -204,3 +254,9 @@ def update_company_info(
         passport_hash: _passport_hash
     })
     log CompanyUpdated(msg.sender, _company_id)
+
+@external
+def approve_update(user: address):
+    assert msg.sender == self.owner, "Only owner can approve"
+    self.update_approval[user] = True
+    log UpdateApproved(user, block.timestamp)
