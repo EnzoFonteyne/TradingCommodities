@@ -189,7 +189,7 @@ def register_company(
     assert _legal_representative != "", "Legal representative required"
     assert _passport_number != "", "Passport number required"
     assert _passport_hash != empty(bytes32), "Passport hash required"
-    assert not self.companies[msg.sender].name, "Company already registered"
+    assert self.companies[msg.sender].name == "", "Company already registered"
     assert msg.sender != self.owner, "Owner cannot register as a company"
 
     self.companies[msg.sender] = CompanyInfo({
@@ -258,5 +258,6 @@ def update_company_info(
 @external
 def approve_update(user: address):
     assert msg.sender == self.owner, "Only owner can approve"
+    assert self.companies[user].name != "", "Company not registered"
     self.update_approval[user] = True
     log UpdateApproved(user, block.timestamp)
