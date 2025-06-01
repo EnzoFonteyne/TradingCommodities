@@ -21,7 +21,6 @@ struct CompanyInfo:
     passport_hash: bytes32  # hash of the passport file (e.g., IPFS hash or Keccak256)
 
 owner: public(address)
-owner_info: public(CompanyInfo)
 companies: public(HashMap[address, CompanyInfo])
 update_approval: public(HashMap[address, bool])
 
@@ -78,6 +77,16 @@ def get_registration_institution(user: address) -> String[100]:
     return self.companies[user].registration_institution
 
 @external
+@view
+def get_legal_representative(user: address) -> String[100]:
+    return self.companies[user].legal_representative
+
+@external
+@view
+def get_legal_representative_position(user: address) -> String[50]:
+    return self.companies[user].position
+
+@external
 def __init__(
     _name: String[100],
     _hq_address: String[200],
@@ -103,7 +112,7 @@ def __init__(
     assert _passport_hash != empty(bytes32), "Passport hash required"
 
     self.owner = msg.sender
-    self.owner_info = CompanyInfo({
+    self.companies[self.owner] = CompanyInfo({
         name: _name,
         headquarters_address: _hq_address,
         city: _city,
@@ -147,7 +156,7 @@ def update_owner_info(
     assert _passport_number != "", "Passport number required"
     assert _passport_hash != empty(bytes32), "Passport hash required"
 
-    self.owner_info = CompanyInfo({
+    self.companies[self.owner] = CompanyInfo({
         name: _name,
         headquarters_address: _hq_address,
         city: _city,
