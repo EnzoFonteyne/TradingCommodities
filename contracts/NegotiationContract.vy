@@ -215,7 +215,6 @@ def acceptNegotiation():
 
     if self.accepted_by_buyer and self.accepted_by_seller:
         self.current_status = "FINALIZED"
-        # Simples hash usando índice e timestamp
         final_hash: bytes32 = keccak256(concat(convert(len(self.proposals)-1, bytes32), convert(block.timestamp, bytes32)))
         log NegotiationFinalized(block.timestamp, final_hash)
 
@@ -237,6 +236,7 @@ def getCurrentProposal() -> Proposal:
 
 @external
 def mockAuditCompliance():
+    assert msg.sender == self.auditor, "Only auditor can mock audit"
     self.audit_passed = True
     log MockAuditPerformed(msg.sender, block.timestamp, "SUCCESS")
 
