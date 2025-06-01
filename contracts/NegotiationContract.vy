@@ -4,22 +4,6 @@
 
 from vyper.interfaces import ERC20
 
-struct Proposal:
-    commodity: String[100]
-    commodity_origin: String[100]
-    specifications: String[300]
-    total_qty: uint256
-    monthly_qty: uint256
-    price_per_mt: uint256
-    incoterm: String[10]
-    payment_terms: String[200]
-    inspection_agency: String[100]
-    buyer_bank_info: String[200]
-    seller_bank_info: String[200]
-    attachments_hash: bytes32
-    created_at: uint256
-    proposer: address
-    doc_type: String[10]
 
 buyer: public(address)
 seller: public(address)
