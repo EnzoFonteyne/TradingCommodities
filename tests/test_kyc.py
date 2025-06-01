@@ -182,14 +182,14 @@ def test_owner_can_approve_user(owner, user):
     contract = deploy_kyc(owner)
     register_company(contract, user)
     # Supondo que você tenha uma função approve_update(user) no contrato
-    contract.update_approval[user.address] = True  # ou chame o método se existir
+    contract.approve_update(user.address, sender=owner)  # ou chame o método se existir
     assert contract.update_approval(user.address) == True
 
 # 9. Testa se o endereço consegue atualizar as informações APÓS aprovação do owner
 def test_user_can_update_after_approval(owner, user):
     contract = deploy_kyc(owner)
     register_company(contract, user)
-    contract.update_approval[user.address] = True  # owner aprova
+    contract.approve_update(user.address, sender=owner)  # owner aprova
     info = make_info(name="Empresa Nova")
     update_company_info(contract, user, info)
     assert contract.get_company_name(user.address) == "Empresa Nova"
@@ -198,7 +198,7 @@ def test_user_can_update_after_approval(owner, user):
 def test_view_functions_after_register_and_update(owner, user):
     contract = deploy_kyc(owner)
     register_company(contract, user)
-    contract.update_approval[user.address] = True
+    contract.approve_update(user.address, sender=owner)
     info = make_info(
         name="Empresa Visual",
         country="Paraguai",
