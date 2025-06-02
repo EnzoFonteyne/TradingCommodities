@@ -45,6 +45,12 @@ seller_info: public(CompanySnapshot)
 # Variável para identificar se a due diligence foi finalizada
 due_diligence_finalized: public(bool)
 
+# New state variables for deadline tracking and refund functionality
+refunded: public(bool)  # Prevents double refunds
+approval_deadline: public(uint256)  # Deadline for SPA approval (30 days from latest proposal)
+pop_deadline: public(uint256)  # Deadline for POP approval (30 days from contract initiation)
+bl_deadline: public(uint256)  # Deadline for BL approval (60 days from contract initiation)
+
 # Buyer funds checked
 event BuyerFundsChecked:
     buyer: address
@@ -196,6 +202,17 @@ event PaymentResetForNextMonth:
     current_month: uint256
     event_time: uint256
 
+# New events for refund and cancellation functionality
+event RefundIssued:
+    buyer: address
+    amount: uint256
+    token: address
+    event_time: uint256
+
+event ContractCancelled:
+    reason: String[100]
+    event_time: uint256
+
 # Inicializa o contrato com os endereços do KYC, comprador e vendedor
 @external
 def __init__(kyc_address: address, buyer_: address, seller_: address, _auditor: address):
@@ -229,6 +246,12 @@ def __init__(kyc_address: address, buyer_: address, seller_: address, _auditor: 
     self.payment_amount = 0
     self.payment_released = False
     self.upfront_released = False
+
+    # Initialize new state variables for refund and deadline tracking
+    self.refunded = False
+    self.approval_deadline = 0
+    self.pop_deadline = 0
+    self.bl_deadline = 0
 
 # Funções para assinar as informações do comprador e vendedor
 @external
@@ -304,7 +327,12 @@ def initiateNegotiation(
     trial_shipment_qty: uint256, # Quantidade do embarque de teste em MT
     buyer_address: address # Endereço do comprador
 ):
+    # Check for timeouts and handle cancellation
+    self._checkAndHandleTimeouts()
+    
     assert msg.sender == self.buyer, "Only buyer can initiate"
+    assert self.current_status != "CANCELLED", "Contract cancelled"
+    assert not self.refunded, "Contract already refunded"
     assert self.due_diligence_finalized, "Due diligence not finalized"
     assert buyer_address == self.buyer, "Buyer address mismatch"
     assert self.current_status == "OPEN", "Negotiation already started"
@@ -554,10 +582,73 @@ def current_proposal_is_valid(_current_proposal: SPA_terms):
     result = True
     return result
 
+@internal
+def _refundToBuyer():
+    """
+    Internal helper to refund all USDT balance to buyer and mark contract as cancelled.
+    """
+    assert not self.refunded, "Already refunded"
+    
+    # Check USDT balance held by this contract
+    interface ERC20:
+        def balanceOf(account: address) -> uint256: view
+        def transfer(to: address, amount: uint256) -> bool: nonpayable
+    
+    balance: uint256 = ERC20(self.payment_token).balanceOf(self)
+    
+    if balance > 0:
+        # Transfer all remaining USDT to buyer
+        success: bool = ERC20(self.payment_token).transfer(self.buyer, balance)
+        assert success, "Refund transfer failed"
+        
+        log RefundIssued(self.buyer, balance, self.payment_token, block.timestamp)
+    
+    # Update state
+    self.is_funded = False
+    self.payment_amount = 0
+    self.refunded = True
+    self.current_status = "CANCELLED"
+    
+    log ContractCancelled("Refund issued", block.timestamp)
+
+@internal
+def _checkAndHandleTimeouts():
+    """
+    Check if any deadlines have passed and automatically cancel/refund if needed.
+    """
+    if self.current_status == "CANCELLED" or self.refunded:
+        return
+    
+    current_time: uint256 = block.timestamp
+    
+    # Check SPA approval deadline (30 days from latest proposal)
+    if len(self.proposals) > 0 and self.current_status == "NEGOTIATING":
+        latest_proposal: SPA_terms = self.proposals[len(self.proposals) - 1]
+        if current_time >= latest_proposal.created_at + 2592000:  # 30 days in seconds
+            if not (self.SPA_signed_by_buyer and self.SPA_signed_by_seller):
+                self._refundToBuyer()
+                return
+    
+    # Check POP deadline (30 days from contract initiation)
+    if self.current_status == "RUNNING" and self.pop_deadline > 0:
+        if current_time >= self.pop_deadline and not self.POP_approved:
+            self._refundToBuyer()
+            return
+    
+    # Check BL deadline (60 days from contract initiation)  
+    if self.current_status == "RUNNING" and self.bl_deadline > 0:
+        if current_time >= self.bl_deadline and not self.BL_issued:
+            self._refundToBuyer()
+            return
 
 @external
 def acceptNegotiation():
+    # Check for timeouts and handle cancellation
+    self._checkAndHandleTimeouts()
+    
     assert msg.sender == self.buyer or msg.sender == self.seller, "Only buyer or seller"
+    assert self.current_status != "CANCELLED", "Contract cancelled"
+    assert not self.refunded, "Contract already refunded"
     assert self.due_diligence_finalized, "Due diligence not finalized"
     assert self.current_status == "NEGOTIATING", "Negotiation not active"
 
@@ -632,8 +723,13 @@ def rejectNegotiation():
 @external
 @payable
 def depositPayment():
+    # Check for timeouts and handle cancellation
+    self._checkAndHandleTimeouts()
+    
     assert msg.value == 0, "Do not send ETH, only USDT is accepted"
     assert msg.sender == self.buyer, "Only buyer can deposit"
+    assert self.current_status != "CANCELLED", "Contract cancelled"
+    assert not self.refunded, "Contract already refunded"
     assert self.current_status == "FINALIZED" or self.current_status == "RUNNING", "Negotiation must be finalized"
     assert not self.is_funded, "Already funded"
     assert self.approved_proposal is not None, "No approved proposal found"
@@ -668,13 +764,24 @@ def InitiateContract():
     """
     Auditor inicia o contrato SPA, verificando se as informações do comprador e vendedor foram assinadas.
     """
+    # Check for timeouts and handle cancellation
+    self._checkAndHandleTimeouts()
+    
     assert msg.sender == self.auditor, "Only auditor can initiate contract"
+    assert self.current_status != "CANCELLED", "Contract cancelled"
+    assert not self.refunded, "Contract already refunded"
     assert self.SPA_signed_by_buyer and self.SPA_signed_by_seller, "Both parties must sign SPA"
     assert self.due_diligence_finalized, "Due diligence not finalized"
     assert self.current_status == "FINALIZED", "Negotiation not finalized"
     assert self.is_funded, "Payment must be deposited first"
 
     self.current_status = "RUNNING"
+    
+    # Set deadlines for POP and BL approval
+    current_time: uint256 = block.timestamp
+    self.pop_deadline = current_time + 2592000  # 30 days from now
+    self.bl_deadline = current_time + 5184000   # 60 days from now
+    
     # Aqui você pode adicionar a lógica para iniciar o contrato SPA
     # Por exemplo, transferir fundos, emitir documentos, etc.
 
@@ -682,7 +789,12 @@ def InitiateContract():
 
 @external
 def approvePOP():
+    # Check for timeouts and handle cancellation
+    self._checkAndHandleTimeouts()
+    
     assert msg.sender == self.auditor, "Only auditor can approve POP"
+    assert self.current_status != "CANCELLED", "Contract cancelled"
+    assert not self.refunded, "Contract already refunded"
     assert self.current_status == "RUNNING", "Contract must be running first"
     assert not self.POP_approved, "Proof of Product already approved"
     self.POP_approved = True
@@ -690,7 +802,12 @@ def approvePOP():
 
 @external
 def approveBL():
+    # Check for timeouts and handle cancellation
+    self._checkAndHandleTimeouts()
+    
     assert msg.sender == self.auditor, "Only auditor can approve BL"
+    assert self.current_status != "CANCELLED", "Contract cancelled"
+    assert not self.refunded, "Contract already refunded"
     assert self.current_status == "RUNNING", "Contract must be running first"
     assert not self.BL_issued, "Bill of Landing already issued"
     self.BL_issued = True
@@ -699,12 +816,17 @@ def approveBL():
 
 @external
 def RealeaseUpfront():
+    # Check for timeouts and handle cancellation
+    self._checkAndHandleTimeouts()
+    
+    assert self.current_status != "CANCELLED", "Contract cancelled"
+    assert not self.refunded, "Contract already refunded"
     assert self.is_funded, "Payment not funded"
     assert not self.payment_released, "Payment already released"
     assert self.current_status == "RUNNING", "Contract must be running first"
     assert self.approved_proposal is not None, "No approved proposal found"
     assert self.POP_approved, "Proof of Product not approved"
-    assert not self.payment_terms, "Payment terms dont allow upfront release"
+    assert not self.approved_proposal.payment_terms, "Payment terms dont allow upfront release"
     assert not self.upfront_released, "Upfront payment already released"
     assert self.current_month <= self.approved_proposal.number_of_shipments, "Current month exceeds number of shipments"
     assert self.parcelas_pagamento[self.current_month] is not None, "Payment schedule not created"
@@ -730,6 +852,11 @@ def RealeaseUpfront():
     
 @external
 def BLPaymentReleased():
+    # Check for timeouts and handle cancellation
+    self._checkAndHandleTimeouts()
+    
+    assert self.current_status != "CANCELLED", "Contract cancelled"
+    assert not self.refunded, "Contract already refunded"
     assert self.is_funded, "Payment not funded"
     assert not self.payment_released, "Payment already released"
     assert self.current_status == "RUNNING", "Contract must be running first"
@@ -779,3 +906,37 @@ def BLPaymentReleased():
     self.payment_released = False  # Reseta o estado de pagamento liberado para o próximo mês
 
     log PaymentResetForNextMonth(self.current_month, block.timestamp)
+
+@external
+def requestRefund():
+    """
+    Allows buyer to request refund when conditions are met.
+    """
+    assert msg.sender == self.buyer, "Only buyer can request refund"
+    assert not self.refunded, "Already refunded"
+    assert self.current_status != "CANCELLED", "Contract already cancelled"
+    assert self.is_funded, "No funds to refund or already refunded"
+    
+    current_time: uint256 = block.timestamp
+    can_refund: bool = False
+    
+    # Check if SPA not finalized within 30 days of latest proposal
+    if len(self.proposals) > 0 and self.current_status == "NEGOTIATING":
+        latest_proposal: SPA_terms = self.proposals[len(self.proposals) - 1]
+        if current_time >= latest_proposal.created_at + 2592000:  # 30 days
+            if not (self.SPA_signed_by_buyer and self.SPA_signed_by_seller):
+                can_refund = True
+    
+    # Check if POP deadline passed without approval
+    if self.current_status == "RUNNING" and self.pop_deadline > 0:
+        if current_time >= self.pop_deadline and not self.POP_approved:
+            can_refund = True
+    
+    # Check if BL deadline passed without approval
+    if self.current_status == "RUNNING" and self.bl_deadline > 0:
+        if current_time >= self.bl_deadline and not self.BL_issued:
+            can_refund = True
+    
+    assert can_refund, "Refund conditions not met"
+    
+    self._refundToBuyer()
