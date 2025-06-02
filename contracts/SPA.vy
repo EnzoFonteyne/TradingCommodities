@@ -53,7 +53,7 @@ event BuyerFundsChecked:
     event_time: uint256
 
 # Evento para notificar que a due diligence foi finalizada
-event DueDiligneceFinalized:
+event DueDiligenceFinalized:
     buyer: address
     seller: address
 
@@ -68,6 +68,7 @@ struct SPA_terms:
     specifications: String[300] # Especificações da commodity
     total_qty: uint256 # Quantidade total em MT (metric tons)
     monthly_qty: uint256 # Quantidade mensal em MT
+    number_of_shipments: uint256 # Número de embarques (1-13)
     price_per_mt: uint256 # Preço por tonelada métrica (MT)
     incoterm: String[10] # Incoterm (ex. FOB, CIF, etc.)
     payment_terms: bool # Termos de pagamento (SPOT ou com adiantamnento)
@@ -75,7 +76,7 @@ struct SPA_terms:
     trial_shipment: bool # Se houver embarque de teste
     trial_shipment_qty: uint256 # Quantidade do embarque de teste em MT
     inspection_agency: String[100] # Agência de inspeção
-    buyer_addres: address # Endereço do comprador
+    buyer_address: address # Endereço do comprador
     seller_address: address # Endereço do vendedor
     attachments_hash: bytes32  # Hash dos anexos (pode ser um IPFS hash)
     created_at: uint256 # Timestamp da criação da proposta
@@ -87,21 +88,33 @@ struct SPA_terms:
 auditor: public(address)                    # endereço do auditor externo
 current_status: public(String[20])       # status atual da negociação
 
-proposals: public(DynArray[Proposal, 20]) # lista de propostas feitas durante a negociação
+proposals: public(DynArray[SPA_terms, 20]) # lista de propostas feitas durante a negociação
 SPA_signed_by_buyer: public(bool) # comprador assinou o SPA
 SPA_signed_by_seller: public(bool) # vendedor assinou o SPA
-#audit_passed: public(bool) -----> será substituido por due_diligence_finalized
 
 # Flags para verificar produto e embarque
 POP_approved: public(bool)                # auditor confirmou prova de produto do vendedor
 BL_issued: public(bool)            # auditor certificou embarque (prod. carregado)
 
-is_funded: public(bool)
-payment_amount: public(uint256)
-payment_token: public(address)
-payment_released: public(bool)
+is_funded: public(bool) # se o contrato foi financiado (pagamento depositado)
+payment_amount: public(uint256) # valor total do pagamento a ser feito
+payment_token: public(address) # endereço do token de pagamento (USDT, ETH, etc.)
+upfront_released: public(bool) # se o pagamento adiantado foi liberado
+payment_released: public(bool) # se o pagamento final foi liberado
 
 usdt_address: address = 0xdAC17F958D2ee523a2206206994597C13D831ec7  # endereço do USDT na Ethereum mainnet
+
+approved_proposal: public(SPA_terms) # Proposta aprovada
+
+struct PagamentoParcela:
+    pagamento_upfront: uint256
+    pagamento_bl: uint256
+    comissao_auditor: uint256
+
+# HashMap embarque_num (1-13) => PagamentoParcela
+parcelas_pagamento: public(HashMap[uint256, PagamentoParcela])
+
+current_month: public(uint256) # Mês atual do contrato (1-12)
 
 event NegotiationInitiated:
     proposer: address
@@ -133,14 +146,24 @@ event NegotiationFinalized:
     event_time: uint256
     final_proposal_hash: bytes32
 
+event PaymentScheduleCreated:
+    parcelas_pagamento: HashMap[uint256, PagamentoParcela]
+    current_month: uint256
+    event_time: uint256
+
+event ApprovalRequired:
+    buyer: address
+    usdt_address: address
+    amount: uint256
+
 event NegotiationRejected:
     rejector: address
     event_time: uint256
 
-event MockAuditPerformed:
-    initiator: address
+event ContractInitiated:
+    buyer: address
+    seller: address
     event_time: uint256
-    result: String[20]
 
 # Eventos novos para auditor
 event POP_done:
@@ -157,15 +180,25 @@ event PaymentDeposited:
     token: address
     event_time: uint256
 
+event UpfrontPaymentReleased:
+    recipient: address
+    amount: uint256
+    token: address
+    event_time: uint256
+
 event PaymentReleased:
     recipient: address
     amount: uint256
     token: address
     event_time: uint256
 
+event PaymentResetForNextMonth:
+    current_month: uint256
+    event_time: uint256
+
 # Inicializa o contrato com os endereços do KYC, comprador e vendedor
 @external
-def __init__(kyc_address: address, buyer_: address, seller_: address, _auditor: address, _payment_token: address):
+def __init__(kyc_address: address, buyer_: address, seller_: address, _auditor: address):
     self.kyc_contract = kyc_address
     self.buyer = buyer_
     self.seller = seller_
@@ -183,7 +216,7 @@ def __init__(kyc_address: address, buyer_: address, seller_: address, _auditor: 
     self.due_diligence_finalized = False
 
     # Inicializa as variáveis de negociação
-    self.payment_token = _payment_token
+    self.payment_token = 0xdAC17F958D2ee523a2206206994597C13D831ec7 # Define o token de pagamento como USDT por padrão
 
     self.current_status = "OPEN"
     self.SPA_signed_by_buyer = False
@@ -195,6 +228,7 @@ def __init__(kyc_address: address, buyer_: address, seller_: address, _auditor: 
     self.is_funded = False
     self.payment_amount = 0
     self.payment_released = False
+    self.upfront_released = False
 
 # Funções para assinar as informações do comprador e vendedor
 @external
@@ -252,7 +286,7 @@ def finalize_due_diligence():
         legal_representative_position: KYC(self.kyc_contract).get_legal_representative_position(self.seller)
     })
     self.due_diligence_finalized = True
-    log DueDiligneceFinalized(self.buyer, self.seller)
+    log DueDiligenceFinalized (self.buyer, self.seller)
 
 # Inicia a negociação do contrato SPA
 
@@ -264,6 +298,7 @@ def initiateNegotiation(
     specifications: String[300], # Especificações da commodity
     total_qty: uint256, # Quantidade total em MT (metric tons)
     monthly_qty: uint256, # Quantidade mensal em MT
+    number_of_shipments: uint256, # Número de embarques (1-13)
     incoterm: String[10], # Incoterm (ex. FOB, CIF, etc.)
     trial_shipment: bool, # Se houver embarque de teste
     trial_shipment_qty: uint256, # Quantidade do embarque de teste em MT
@@ -281,7 +316,7 @@ def initiateNegotiation(
     self.POP_approved = False
     self.BL_issued = False
 
-    proposal: Proposal = SPA_terms({
+    proposal: SPA_terms = SPA_terms({
         commodity: commodity,
         commodity_origin: commodity_origin,
         port_of_discharge: port_of_discharge,
@@ -362,7 +397,7 @@ def set_auditor(_auditor: address, _auditor_commission: uint256, _auditor_commis
     
     current_proposal = self.proposals[len(self.proposals)-1]
 
-    self.auditor = _auditor_commission
+    self.auditor = _auditor
 
     current_proposal.auditor = _auditor
 
@@ -382,6 +417,7 @@ def set_auditor(_auditor: address, _auditor_commission: uint256, _auditor_commis
 
     log AuditorSet(_auditor, _auditor_commission, _auditor_commission_pct, block.timestamp)
 
+@external 
 def change_payment_terms(new_payment_terms: bool, new_upfront_payment_pct: uint256, new_price_per_mt: uint256):
     """
     Altera os termos de pagamento da negociação.
@@ -414,6 +450,7 @@ def change_payment_terms(new_payment_terms: bool, new_upfront_payment_pct: uint2
     self.proposals.append(current_proposal)
     log NewPaymentTerms(new_payment_terms, new_upfront_payment_pct, new_price_per_mt, msg.sender, block.timestamp)
 
+@external
 def set_new_proposal(
     commodity: String[100], # Nome da commodity
     commodity_origin: String[100], # Origem da commodity (país)
@@ -429,7 +466,7 @@ def set_new_proposal(
     trial_shipment: bool, # Se houver embarque de teste
     trial_shipment_qty: uint256, # Quantidade do embarque de teste em MT
     inspection_agency: String[100], # Agência de inspeção
-    buyer_addres: address, # Endereço do comprador
+    buyer_address: address, # Endereço do comprador
     seller_address: address, # Endereço do vendedor
     attachments_hash: bytes32,  # Hash dos anexos (pode ser um IPFS hash)
     created_at: uint256, # Timestamp da criação da proposta
@@ -449,7 +486,7 @@ def set_new_proposal(
     self.POP_approved = False
     self.BL_issued = False
 
-    proposal: Proposal = SPA_terms({
+    proposal: SPA_terms = SPA_terms({
         commodity: commodity,
         commodity_origin: commodity_origin,
         port_of_loading: port_of_loading,
@@ -464,7 +501,7 @@ def set_new_proposal(
         trial_shipment: trial_shipment,
         trial_shipment_qty: trial_shipment_qty,
         inspection_agency: inspection_agency,
-        buyer_address: buyer_addres,
+        buyer_address: buyer_address,
         seller_address: seller_address,
         attachments_hash: attachments_hash,
         created_at: created_at,
@@ -473,6 +510,49 @@ def set_new_proposal(
         auditor_commission_pct: auditor_commission_pct,
         auditor_commission: auditor_commission
     })
+
+    self.proposals.append(proposal)
+
+@internal
+def current_proposal_is_valid(_current_proposal: SPA_terms):
+    """
+    Verifica se a proposta atual é válida.
+    """
+    result: bool = False
+    assert _current_proposal.commodity != "", "Commodity must be specified"
+    assert _current_proposal.commodity_origin != "", "Commodity origin must be specified"
+    assert _current_proposal.port_of_loading != "", "Port of loading must be specified"
+    assert _current_proposal.port_of_discharge != "", "Port of discharge must be specified"
+    assert _current_proposal.specifications != "", "Specifications must be provided"
+    assert _current_proposal.total_qty > 0, "Total quantity must be greater than zero"
+    assert _current_proposal.monthly_qty > 0, "Monthly quantity must be greater than zero"
+    assert _current_proposal.number_of_shipments >= 1 and _current_proposal.number_of_shipments <= 13, "Number of shipments must be between 1 and 13"
+    assert _current_proposal.price_per_mt > 0, "Price per MT must be greater than zero"
+    assert _current_proposal.incoterm != "", "Incoterm must be specified"
+    assert _current_proposal.inspection_agency != "", "Inspection agency must be specified"
+    assert _current_proposal.buyer_address != ZERO_ADDRESS, "Buyer address required"
+    assert _current_proposal.seller_address != ZERO_ADDRESS, "Seller address required"
+    assert _current_proposal.attachments_hash != empty(bytes32), "Attachments hash required"
+    assert _current_proposal.created_at > 0, "Proposal creation time required"
+    assert _current_proposal.proposer != ZERO_ADDRESS, "Proposer address required"
+    assert _current_proposal.auditor != ZERO_ADDRESS, "Auditor address required"
+    # payment_terms (bool) não precisa checagem de vazio
+    if not _current_proposal.payment_terms:
+        assert _current_proposal.upfront_payment_pct > 0 and _current_proposal.upfront_payment_pct <= 100, "Upfront payment pct must be 1-100"
+    else:
+        assert _current_proposal.upfront_payment_pct == 0, "Upfront pct must be zero for SPOT"
+    # trial_shipment (bool) não precisa checagem de vazio
+    if _current_proposal.trial_shipment:
+        assert _current_proposal.trial_shipment_qty > 0, "Trial shipment qty must be > 0 if trial shipment enabled"
+    else:
+        assert _current_proposal.trial_shipment_qty == 0, "Trial shipment qty must be zero if trial shipment disabled"
+    # auditor_commission_pct (bool): não precisa checar vazio
+    if _current_proposal.auditor_commission_pct:
+        assert _current_proposal.auditor_commission > 0 and _current_proposal.auditor_commission <= 100, "Auditor commission pct must be 1-100"
+    else:
+        assert _current_proposal.auditor_commission >= 0, "Auditor commission (fixed) must be >= 0"
+    result = True
+    return result
 
 
 @external
@@ -483,8 +563,7 @@ def acceptNegotiation():
 
     current_proposal = self.proposals[len(self.proposals)-1]
 
-    for variaveis in current_proposal:
-        assert variaveis != "", "All proposal fields must be filled"
+    assert current_proposal_is_valid(current_proposal), "Current proposal is not valid"
 
     if msg.sender == self.buyer:
         self.SPA_signed_by_buyer = True
@@ -493,16 +572,96 @@ def acceptNegotiation():
 
     log NegotiationAccepted(msg.sender, block.timestamp)
 
-    if self.accepted_by_buyer and self.accepted_by_seller:
+    if self.SPA_signed_by_buyer and self.SPA_signed_by_seller:
+        self.approved_proposal = current_proposal
         self.current_status = "FINALIZED"
         final_hash: bytes32 = keccak256(concat(convert(len(self.proposals)-1, bytes32), convert(block.timestamp, bytes32)))
         log NegotiationFinalized(block.timestamp, final_hash)
+    
+    # Define dicionario de parcelas de pagamento
+    if self.approved_proposal.trial_shipment:
+        embarque_num: uint256 = self.approved_proposal.number_of_shipments + 1  # Adiciona o embarque de teste
+    else:
+        embarque_num: uint256 = self.approved_proposal.number_of_shipments
+    
+    for i in range(1, embarque_num + 1):
+        if self.approved_proposal.trial_shipment and i==1:
+            if self.approved_proposal.payment_terms:
+                # Se for SPOT, não há pagamento adiantado
+                pagamento_upfront: uint256 = 0
+                pagamento_bl: uint256 = self.approved_proposal.trial_shipment_qty * self.approved_proposal.price_per_mt
+                comissao_auditor: uint256 = (self.approved_proposal.auditor_commission * pagamento_bl) / 100 if self.approved_proposal.auditor_commission_pct else self.approved_proposal.auditor_commission
+            else:
+                # Se for com adiantamento, calcula o valor do pagamento adiantado
+                pagamento_upfront: uint256 = (self.approved_proposal.upfront_payment_pct * self.approved_proposal.trial_shipment_qty * self.approved_proposal.price_per_mt) / 100
+                pagamento_bl: uint256 = (self.approved_proposal.trial_shipment_qty * self.approved_proposal.price_per_mt) - pagamento_upfront
+                comissao_auditor: uint256 = (self.approved_proposal.auditor_commission* (pagamento_bl+pagamento_upfront)) / 100 if self.approved_proposal.auditor_commission_pct else self.approved_proposal.auditor_commission
+        elif self.approved_proposal.payment_terms:
+            # Se for SPOT, não há pagamento adiantado
+            pagamento_upfront: uint256 = 0
+            pagamento_bl: uint256 = self.approved_proposal.price_per_mt * self.approved_proposal.monthly_qty
+            comissao_auditor: uint256 = (self.approved_proposal.auditor_commission * pagamento_bl) / 100 if self.approved_proposal.auditor_commission_pct else self.approved_proposal.auditor_commission
+        else:
+            # Se for com adiantamento, calcula o valor do pagamento adiantado
+            pagamento_upfront: uint256 = (self.approved_proposal.upfront_payment_pct * self.approved_proposal.price_per_mt * self.approved_proposal.monthly_qty) / 100
+            pagamento_bl: uint256 = (self.approved_proposal.price_per_mt * self.approved_proposal.monthly_qty) - pagamento_upfront
+            comissao_auditor: uint256 = (self.approved_proposal.auditor_commission * (pagamento_bl+pagamento_upfront)) / 100 if self.approved_proposal.auditor_commission_pct else self.approved_proposal.auditor_commission
+        
+        # Armazena as parcelas de pagamento no dicionário
+        self.parcelas_pagamento[i] = PagamentoParcela({
+            pagamento_upfront: pagamento_upfront,
+            pagamento_bl: pagamento_bl,
+            comissao_auditor: comissao_auditor
+        })
+
+    self.current_month = 1  # Inicia o mês atual como 1
+
+    log PaymentScheduleCreated(self.parcelas_pagamento, self.current_month, block.timestamp)
+
+    # Emitir orientação para o buyer aprovar o contrato
+    payment_amount: uint256 = self.parcelas_pagamento[1].pagamento_bl  # Valor do primeiro pagamento BL
+    log ApprovalRequired(self.buyer, self.usdt_address, payment_amount)
 
 @external
 def rejectNegotiation():
     assert msg.sender == self.buyer or msg.sender == self.seller, "Only buyer or seller"
+    assert self.current_status == "NEGOTIATING", "Negotiation not active"
     self.current_status = "REJECTED"
     log NegotiationRejected(msg.sender, block.timestamp)
+
+@external
+@payable
+def depositPayment():
+    assert msg.value == 0, "Do not send ETH, only USDT is accepted"
+    assert msg.sender == self.buyer, "Only buyer can deposit"
+    assert self.current_status == "FINALIZED" or self.current_status == "RUNNING", "Negotiation must be finalized"
+    assert not self.is_funded, "Already funded"
+    assert self.approved_proposal is not None, "No approved proposal found"
+    assert self.current_month <= self.approved_proposal.number_of_shipments, "Current month exceeds number of shipments"
+    assert self.parcelas_pagamento[self.current_month] is not None, "Payment schedule not created"
+
+    _payment_amount: uint256 = self.parcelas_pagamento[self.current_month].pagamento_bl + self.parcelas_pagamento[self.current_month].pagamento_upfront + self.parcelas_pagamento[self.current_month].comissao_auditor # Valor do embarque atual
+
+    # Salva informações do depósito esperado
+    self.payment_token = usdt_address
+    self.payment_amount = _payment_amount
+
+    # Transferência do USDT do comprador para o contrato SPA
+    # O comprador precisa ter chamado approve(usdt_address, spa_contract_address, payment_amount) ANTES
+    response: Bytes[32] = raw_call(
+        self.payment_token,
+        concat(
+            method_id("transferFrom(address,address,uint256)"),
+            convert(msg.sender, bytes32),
+            convert(self, bytes32),
+            convert(_payment_amount, bytes32)
+        ),
+        max_outsize=32,
+        revert_on_failure=True
+    )
+
+    self.is_funded = True
+    log PaymentDeposited(msg.sender, self.payment_amount, self.payment_token, block.timestamp)
 
 @external
 def InitiateContract():
@@ -510,13 +669,113 @@ def InitiateContract():
     Auditor inicia o contrato SPA, verificando se as informações do comprador e vendedor foram assinadas.
     """
     assert msg.sender == self.auditor, "Only auditor can initiate contract"
-    assert self.buyer_info_signed and self.seller_info_signed, "Both parties must sign info"
+    assert self.SPA_signed_by_buyer and self.SPA_signed_by_seller, "Both parties must sign SPA"
     assert self.due_diligence_finalized, "Due diligence not finalized"
     assert self.current_status == "FINALIZED", "Negotiation not finalized"
+    assert self.is_funded, "Payment must be deposited first"
 
     self.current_status = "RUNNING"
     # Aqui você pode adicionar a lógica para iniciar o contrato SPA
     # Por exemplo, transferir fundos, emitir documentos, etc.
 
     log ContractInitiated(self.buyer, self.seller, block.timestamp)
+
+@external
+def approvePOP():
+    assert msg.sender == self.auditor, "Only auditor can approve POP"
+    assert self.current_status == "RUNNING", "Contract must be running first"
+    assert not self.POP_approved, "Proof of Product already approved"
+    self.POP_approved = True
+    log POP_done(msg.sender, block.timestamp)
+
+@external
+def approveBL():
+    assert msg.sender == self.auditor, "Only auditor can approve BL"
+    assert self.current_status == "RUNNING", "Contract must be running first"
+    assert not self.BL_issued, "Bill of Landing already issued"
+    self.BL_issued = True
+    log BL_done(msg.sender, block.timestamp)
+
+
+@external
+def RealeaseUpfront():
+    assert self.is_funded, "Payment not funded"
+    assert not self.payment_released, "Payment already released"
+    assert self.current_status == "RUNNING", "Contract must be running first"
+    assert self.approved_proposal is not None, "No approved proposal found"
+    assert self.POP_approved, "Proof of Product not approved"
+    assert not self.payment_terms, "Payment terms dont allow upfront release"
+    assert not self.upfront_released, "Upfront payment already released"
+    assert self.current_month <= self.approved_proposal.number_of_shipments, "Current month exceeds number of shipments"
+    assert self.parcelas_pagamento[self.current_month] is not None, "Payment schedule not created"
+
+    upfront_payment: uint256 = self.parcelas_pagamento[self.current_month].pagamento_upfront
+    self.parcelas_pagamento[self.current_month].pagamento_upfront = 0  # Zera o pagamento adiantado para não liberar novamente
+
+    self.upfront_released = True
+
+    # Transferir o pagamento adiantado para o auditor
+    response: Bytes[32] = raw_call(
+        self.payment_token,
+        concat(
+            method_id("transfer(address,uint256)"),
+            convert(self.seller, bytes32),
+            convert(upfront_payment, bytes32)
+        ),
+        max_outsize=32,
+        revert_on_failure=True
+    )
+
+    log UpfrontPaymentReleased(self.seller, upfront_payment, self.payment_token, block.timestamp)
     
+@external
+def BLPaymentReleased():
+    assert self.is_funded, "Payment not funded"
+    assert not self.payment_released, "Payment already released"
+    assert self.current_status == "RUNNING", "Contract must be running first"
+    assert self.approved_proposal is not None, "No approved proposal found"
+    assert self.POP_approved, "Proof of Product not approved"
+    assert self.BL_issued, "Bill of Landing not issued yet"
+    assert self.current_month <= self.approved_proposal.number_of_shipments, "Current month exceeds number of shipments"
+    assert self.parcelas_pagamento[self.current_month] is not None, "Payment schedule not created"
+
+    payment_bl: uint256 = self.parcelas_pagamento[self.current_month].pagamento_bl
+    auditor_commission: uint256 = self.parcelas_pagamento[self.current_month].comissao_auditor
+
+    self.parcelas_pagamento[self.current_month].pagamento_bl = 0  # Zera o pagamento BL para não liberar novamente
+    self.parcelas_pagamento[self.current_month].comissao_auditor = 0  # Zera a comissão do auditor para não liberar novamente
+    
+
+    response: Bytes[32] = raw_call(
+        self.payment_token,
+        concat(
+            method_id("transfer(address,uint256)"),
+            convert(self.seller, bytes32),
+            convert(payment_bl, bytes32)
+        ),
+        max_outsize=32,
+        revert_on_failure=True
+    )
+
+    response: Bytes[32] = raw_call(
+        self.payment_token,
+        concat(
+            method_id("transfer(address,uint256)"),
+            convert(self.auditor, bytes32),
+            convert(auditor_commission, bytes32)
+        ),
+        max_outsize=32,
+        revert_on_failure=True
+    )
+
+    # Transferir o pagamento restante para o vendedor
+    self.payment_released = True
+
+    log PaymentReleased(self.seller, self.payment_amount, self.payment_token, block.timestamp)
+
+    self.is_funded = False  # Zera o estado de financiamento após o pagamento
+    self.current_month += 1  # Avança para o próximo mês
+    self.upfront_released = False  # Reseta o estado de pagamento adiantado para o próximo mês
+    self.payment_released = False  # Reseta o estado de pagamento liberado para o próximo mês
+
+    log PaymentResetForNextMonth(self.current_month, block.timestamp)
